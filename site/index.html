@@ -74,6 +74,12 @@
         <input id="threshold" type="range" min="0.5" max="0.99" step="0.01" value="0.80">
         <span id="thresholdVal" class="num">0.80</span>
       </label>
+      <label>價格刻度
+        <select id="scale" title="對數刻度以漲跌百分比比較形狀，長期間或大漲大跌時差異較明顯">
+          <option value="linear" selected>線性（真實股價）</option>
+          <option value="log">對數</option>
+        </select>
+      </label>
       <label>最小振幅
         <select id="minAmp" title="比對期間內收盤價最高與最低的差距，過濾掉幾乎沒波動、看不出形狀的股票">
           <option value="0">不限</option><option value="0.03">3%</option><option value="0.05" selected>5%</option>
@@ -237,6 +243,7 @@ function search() {
   const threshold = +$("threshold").value;
   const limit = +$("limit").value;
   const minAmp = +$("minAmp").value;
+  const logScale = $("scale").value === "log";
   const target = strokeToSeries(n);
   clearResults();
   if (!target) { $("status").textContent = "請在畫布上畫一條較長的走勢線。"; return; }
@@ -247,8 +254,8 @@ function search() {
   const hits = [];
   DATA.close.forEach((series, idx) => {
     const win = series.slice(-n);
-    if (win.length < n || win.some(v => v === null)) return;
-    const z = zscore(win);
+    if (win.length < n || win.some(v => v === null || v <= 0)) return;
+    const z = zscore(logScale ? win.map(Math.log) : win);
     if (!z) return;
     let r = 0; for (let i = 0; i < n; i++) r += z[i] * tz[i];
     r /= n;
@@ -284,12 +291,12 @@ function search() {
     card.querySelector(".info").textContent = `${s.market}・${s.industry}`;
     $("results").appendChild(card);
     const el = card.querySelector(".chart");
-    el._render = () => renderCandles(el, s.id, h.win, tz);
+    el._render = () => renderCandles(el, s.id, h.win, tz, logScale);
     chartObserver.observe(el);
   }
 }
 
-async function renderCandles(el, id, win, tz) {
+async function renderCandles(el, id, win, tz, logScale) {
   let ohlc;
   try {
     const r = await fetch(`data/ohlc/${id}.json?v=${encodeURIComponent(DATA.updated)}`);
@@ -317,9 +324,14 @@ async function renderCandles(el, id, win, tz) {
   }
 
   // Map the drawn shape onto the matched window's price level and spread.
-  const mean = win.reduce((a, b) => a + b, 0) / n;
-  const sd = Math.sqrt(win.reduce((a, b) => a + (b - mean) ** 2, 0) / n);
-  const shape = tz.map((z, i) => ({ time: DATA.dates[total - n + i], value: mean + z * sd }));
+  // In log mode the fit happens on log prices, so map back with exp.
+  const base = logScale ? win.map(Math.log) : win;
+  const mean = base.reduce((a, b) => a + b, 0) / n;
+  const sd = Math.sqrt(base.reduce((a, b) => a + (b - mean) ** 2, 0) / n);
+  const shape = tz.map((z, i) => {
+    const v = mean + z * sd;
+    return { time: DATA.dates[total - n + i], value: logScale ? Math.exp(v) : v };
+  });
 
   const chart = LightweightCharts.createChart(el, {
     autoSize: true,
@@ -328,7 +340,10 @@ async function renderCandles(el, id, win, tz) {
       attributionLogo: false,  // attribution is in the footer instead
     },
     grid: { vertLines: { visible: false }, horzLines: { color: css("--grid") } },
-    rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.08, bottom: 0.08 } },
+    rightPriceScale: {
+      borderVisible: false, scaleMargins: { top: 0.08, bottom: 0.08 },
+      mode: logScale ? LightweightCharts.PriceScaleMode.Logarithmic : LightweightCharts.PriceScaleMode.Normal,
+    },
     timeScale: { borderVisible: false, fixLeftEdge: true, fixRightEdge: true },
     handleScroll: false,
     handleScale: false,
@@ -348,7 +363,7 @@ async function renderCandles(el, id, win, tz) {
 }
 
 $("threshold").addEventListener("input", (e) => { $("thresholdVal").textContent = (+e.target.value).toFixed(2); });
-["threshold", "period", "minAmp", "limit"].forEach(id => $(id).addEventListener("change", search));
+["threshold", "period", "scale", "minAmp", "limit"].forEach(id => $(id).addEventListener("change", search));
 $("clear").addEventListener("click", () => {
   stroke = []; redrawPad();
   clearResults();
