@@ -7,14 +7,14 @@
 <style>
   :root {
     --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7280;
-    --border: #e3e6eb; --accent: #2563eb; --stroke: #e11d48; --up: #dc2626; --down: #16a34a;
-    --grid: #eef0f3;
+    --border: #e3e6eb; --accent: #2563eb; --stroke: #1d4ed8; --up: #dc2626; --down: #16a34a;
+    --grid: #eef0f3; --context: #c4c9d2;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #12151b; --panel: #1b1f27; --text: #e6e8ec; --muted: #9aa1ad;
-      --border: #2c313b; --accent: #60a5fa; --stroke: #fb7185; --up: #f87171; --down: #4ade80;
-      --grid: #232833;
+      --border: #2c313b; --accent: #60a5fa; --stroke: #3b82f6; --up: #f87171; --down: #4ade80;
+      --grid: #232833; --context: #4a505c;
     }
   }
   * { box-sizing: border-box; }
@@ -36,17 +36,18 @@
   .num { font-variant-numeric: tabular-nums; min-width: 3.2em; display: inline-block; }
   #status { color: var(--muted); font-size: .9rem; margin: 20px 0 10px; }
   #results { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
-    text-decoration: none; color: inherit; display: block; }
-  .card:hover { border-color: var(--accent); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
   .card .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .card .head a { color: inherit; text-decoration: none; }
+  .card .head a:hover .name { color: var(--accent); }
   .card .name { font-weight: 600; }
   .card .id { color: var(--muted); font-size: .85rem; margin-left: 4px; }
   .card .score { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--accent); }
-  .card canvas { width: 100%; height: 90px; display: block; margin: 6px 0; }
+  .card .chart { width: 100%; height: 140px; margin: 6px 0; }
   .card .meta { display: flex; justify-content: space-between; color: var(--muted); font-size: .8rem; }
   .up { color: var(--up); } .down { color: var(--down); }
   .legend { display: flex; gap: 14px; font-size: .8rem; color: var(--muted); margin-bottom: 10px; }
+  footer a { color: inherit; }
   .legend i { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
   footer { color: var(--muted); font-size: .8rem; margin-top: 32px; }
 </style>
@@ -61,6 +62,8 @@
     <div class="controls">
       <label>比對期間
         <select id="period">
+          <option value="5">近 5 日（約 1 週）</option>
+          <option value="10">近 10 日（約 2 週）</option>
           <option value="20">近 20 日（約 1 個月）</option>
           <option value="60" selected>近 60 日（約 3 個月）</option>
           <option value="120">近 120 日（約半年）</option>
@@ -70,6 +73,12 @@
       <label>相似度門檻
         <input id="threshold" type="range" min="0.5" max="0.99" step="0.01" value="0.80">
         <span id="thresholdVal" class="num">0.80</span>
+      </label>
+      <label>最小振幅
+        <select id="minAmp" title="比對期間內收盤價最高與最低的差距，過濾掉幾乎沒波動、看不出形狀的股票">
+          <option value="0">不限</option><option value="0.03">3%</option><option value="0.05" selected>5%</option>
+          <option value="0.1">10%</option><option value="0.2">20%</option><option value="0.3">30%</option>
+        </select>
       </label>
       <label>最多顯示
         <select id="limit">
@@ -82,14 +91,16 @@
 
   <div id="status">載入股價資料中…</div>
   <div class="legend" id="legend" hidden>
-    <span><i style="background:var(--accent)"></i>股價（調整後收盤）</span>
+    <span><i style="background:var(--up)"></i><i style="background:var(--down)"></i>比對區間 K 棒（漲紅跌綠）</span>
+    <span><i style="background:var(--context)"></i>比對區間前</span>
     <span><i style="background:var(--stroke)"></i>你的圖形</span>
   </div>
   <div id="results"></div>
 
-  <footer>資料來源：FinLab（調整後收盤價），每個交易日自動更新。相似度為 Pearson 相關係數，僅比較形狀、不比較漲跌幅大小。本工具僅供參考，不構成投資建議。</footer>
+  <footer>資料來源：FinLab（調整後股價），每個交易日自動更新。相似度為收盤價與圖形的 Pearson 相關係數，僅比較形狀、不比較漲跌幅大小。本工具僅供參考，不構成投資建議。圖表使用 <a href="https://www.tradingview.com/lightweight-charts/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a>。</footer>
 </main>
 
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 const pad = $("pad");
@@ -202,15 +213,32 @@ function zscore(a) {
   return a.map(v => (v - m) / s);
 }
 
+const CONTEXT_BARS = 20;  // short windows still show at least this many bars for context
+let charts = [];
+const chartObserver = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    chartObserver.unobserve(e.target);
+    e.target._render();
+  }
+}, { rootMargin: "200px" });
+
+function clearResults() {
+  chartObserver.disconnect();
+  charts.forEach(c => c.remove());
+  charts = [];
+  $("results").innerHTML = "";
+  $("legend").hidden = true;
+}
+
 function search() {
   if (!DATA) return;
   const n = +$("period").value;
   const threshold = +$("threshold").value;
   const limit = +$("limit").value;
+  const minAmp = +$("minAmp").value;
   const target = strokeToSeries(n);
-  const results = $("results");
-  results.innerHTML = "";
-  $("legend").hidden = true;
+  clearResults();
   if (!target) { $("status").textContent = "請在畫布上畫一條較長的走勢線。"; return; }
   const tz = zscore(target);
   if (!tz) { $("status").textContent = "畫的是一條水平線，請畫出有起伏的走勢。"; return; }
@@ -224,7 +252,9 @@ function search() {
     if (!z) return;
     let r = 0; for (let i = 0; i < n; i++) r += z[i] * tz[i];
     r /= n;
-    if (r >= threshold) hits.push({ idx, r, win });
+    if (r < threshold) return;
+    const amp = Math.max(...win) / Math.min(...win) - 1;
+    if (amp >= minAmp) hits.push({ idx, r, win, amp });
   });
   hits.sort((a, b) => b.r - a.r);
 
@@ -238,50 +268,90 @@ function search() {
   for (const h of hits.slice(0, limit)) {
     const s = DATA.stocks[h.idx];
     const ret = h.win[n - 1] / h.win[0] - 1;
-    const a = document.createElement("a");
-    a.className = "card";
-    a.href = `https://tw.stock.yahoo.com/quote/${s.id}`;
-    a.target = "_blank"; a.rel = "noopener";
-    a.innerHTML = `
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `
       <div class="head">
-        <div><span class="name"></span><span class="id"></span></div>
+        <a target="_blank" rel="noopener"><span class="name"></span><span class="id"></span></a>
         <span class="score">${(h.r * 100).toFixed(1)}%</span>
       </div>
-      <canvas></canvas>
+      <div class="chart"></div>
       <div class="meta"><span class="info"></span>
-        <span class="${ret >= 0 ? "up" : "down"}">${ret >= 0 ? "+" : ""}${(ret * 100).toFixed(1)}%</span></div>`;
-    a.querySelector(".name").textContent = s.name;
-    a.querySelector(".id").textContent = s.id;
-    a.querySelector(".info").textContent = `${s.market}・${s.industry}`;
-    results.appendChild(a);
-    drawSpark(a.querySelector("canvas"), zscore(h.win), tz);
+        <span>振幅 ${(h.amp * 100).toFixed(1)}%・<span class="${ret >= 0 ? "up" : "down"}">${ret >= 0 ? "+" : ""}${(ret * 100).toFixed(1)}%</span></span></div>`;
+    card.querySelector("a").href = `https://tw.stock.yahoo.com/quote/${s.id}`;
+    card.querySelector(".name").textContent = s.name;
+    card.querySelector(".id").textContent = s.id;
+    card.querySelector(".info").textContent = `${s.market}・${s.industry}`;
+    $("results").appendChild(card);
+    const el = card.querySelector(".chart");
+    el._render = () => renderCandles(el, s.id, h.win, tz);
+    chartObserver.observe(el);
   }
 }
 
-function drawSpark(canvas, price, target) {
-  const { c, w, h } = fitCanvas(canvas);
-  const all = price.concat(target);
-  const lo = Math.min(...all), hi = Math.max(...all);
-  const pad = 4;
-  const line = (a, color, width) => {
-    c.strokeStyle = color; c.lineWidth = width; c.lineJoin = "round";
-    c.beginPath();
-    a.forEach((v, i) => {
-      const x = i / (a.length - 1) * w;
-      const y = pad + (1 - (v - lo) / (hi - lo)) * (h - 2 * pad);
-      i ? c.lineTo(x, y) : c.moveTo(x, y);
-    });
-    c.stroke();
-  };
-  c.globalAlpha = 0.55; line(target, css("--stroke"), 2);
-  c.globalAlpha = 1; line(price, css("--accent"), 1.6);
+async function renderCandles(el, id, win, tz) {
+  let ohlc;
+  try {
+    const r = await fetch(`data/ohlc/${id}.json?v=${encodeURIComponent(DATA.updated)}`);
+    if (!r.ok) throw new Error(r.status);
+    ohlc = await r.json();
+  } catch (err) {
+    el.textContent = `K 棒資料載入失敗（${err.message}）`;
+    return;
+  }
+  if (!el.isConnected) return;  // results were replaced while loading
+
+  const n = win.length;
+  const total = DATA.dates.length;
+  const from = total - Math.max(n, CONTEXT_BARS);
+  const bars = [];
+  const contextColor = css("--context");
+  for (let i = Math.max(0, from); i < total; i++) {
+    const [o, h, l, c] = [ohlc.o[i], ohlc.h[i], ohlc.l[i], ohlc.c[i]];
+    if ([o, h, l, c].some(v => v === null)) continue;
+    const bar = { time: DATA.dates[i], open: o, high: h, low: l, close: c };
+    if (i < total - n) {  // outside the matched window
+      bar.color = bar.borderColor = bar.wickColor = contextColor;
+    }
+    bars.push(bar);
+  }
+
+  // Map the drawn shape onto the matched window's price level and spread.
+  const mean = win.reduce((a, b) => a + b, 0) / n;
+  const sd = Math.sqrt(win.reduce((a, b) => a + (b - mean) ** 2, 0) / n);
+  const shape = tz.map((z, i) => ({ time: DATA.dates[total - n + i], value: mean + z * sd }));
+
+  const chart = LightweightCharts.createChart(el, {
+    autoSize: true,
+    layout: {
+      background: { type: "solid", color: css("--panel") }, textColor: css("--muted"), fontSize: 10,
+      attributionLogo: false,  // attribution is in the footer instead
+    },
+    grid: { vertLines: { visible: false }, horzLines: { color: css("--grid") } },
+    rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.08, bottom: 0.08 } },
+    timeScale: { borderVisible: false, fixLeftEdge: true, fixRightEdge: true },
+    handleScroll: false,
+    handleScale: false,
+  });
+  const up = css("--up"), down = css("--down");
+  chart.addCandlestickSeries({
+    upColor: up, downColor: down, borderUpColor: up, borderDownColor: down,
+    wickUpColor: up, wickDownColor: down,
+    priceLineVisible: false, lastValueVisible: false,
+  }).setData(bars);
+  chart.addLineSeries({
+    color: css("--stroke"), lineWidth: 2,
+    priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+  }).setData(shape);
+  chart.timeScale().fitContent();
+  charts.push(chart);
 }
 
 $("threshold").addEventListener("input", (e) => { $("thresholdVal").textContent = (+e.target.value).toFixed(2); });
-["threshold", "period", "limit"].forEach(id => $(id).addEventListener("change", search));
+["threshold", "period", "minAmp", "limit"].forEach(id => $(id).addEventListener("change", search));
 $("clear").addEventListener("click", () => {
   stroke = []; redrawPad();
-  $("results").innerHTML = ""; $("legend").hidden = true;
+  clearResults();
   $("status").textContent = DATA ? `資料更新至 ${DATA.dates.at(-1)}，共 ${DATA.stocks.length} 檔。` : "";
 });
 window.addEventListener("resize", redrawPad);

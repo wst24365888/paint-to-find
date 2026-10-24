@@ -9,8 +9,9 @@
 ## 結構
 
 ```
-update_data.py                 從 FinLab 抓股價 → site/data/prices.json
-site/index.html                畫布 + 比對邏輯（單一檔案，無建置步驟）
+update_data.py                 從 FinLab 抓股價 → site/data/prices.json（比對用收盤價）
+                               + site/data/ohlc/<id>.json（顯示用 K 棒）
+site/index.html                畫布 + 比對邏輯 + Lightweight Charts K 棒（單一檔案，無建置步驟）
 .github/workflows/deploy.yml   每個交易日 18:30（台灣時間）抓資料並部署 Pages
 ```
 
