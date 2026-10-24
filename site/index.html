@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>畫圖找股</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7280;
+    --border: #e3e6eb; --accent: #2563eb; --stroke: #e11d48; --up: #dc2626; --down: #16a34a;
+    --grid: #eef0f3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --panel: #1b1f27; --text: #e6e8ec; --muted: #9aa1ad;
+      --border: #2c313b; --accent: #60a5fa; --stroke: #fb7185; --up: #f87171; --down: #4ade80;
+      --grid: #232833;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans TC", "Microsoft JhengHei", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: .9rem; margin: 0 0 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  #pad { width: 100%; height: 300px; display: block; touch-action: none; cursor: crosshair;
+    border-radius: 8px; background: var(--bg); }
+  .controls { display: flex; flex-wrap: wrap; gap: 16px 24px; align-items: center; margin-top: 14px; font-size: .9rem; }
+  .controls label { display: flex; align-items: center; gap: 8px; }
+  select, button { font: inherit; color: var(--text); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  input[type=range] { width: 140px; accent-color: var(--accent); }
+  .num { font-variant-numeric: tabular-nums; min-width: 3.2em; display: inline-block; }
+  #status { color: var(--muted); font-size: .9rem; margin: 20px 0 10px; }
+  #results { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+    text-decoration: none; color: inherit; display: block; }
+  .card:hover { border-color: var(--accent); }
+  .card .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .card .name { font-weight: 600; }
+  .card .id { color: var(--muted); font-size: .85rem; margin-left: 4px; }
+  .card .score { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--accent); }
+  .card canvas { width: 100%; height: 90px; display: block; margin: 6px 0; }
+  .card .meta { display: flex; justify-content: space-between; color: var(--muted); font-size: .8rem; }
+  .up { color: var(--up); } .down { color: var(--down); }
+  .legend { display: flex; gap: 14px; font-size: .8rem; color: var(--muted); margin-bottom: 10px; }
+  .legend i { display: inline-block; width: 14px; height: 3px; vertical-align: middle; margin-right: 4px; border-radius: 2px; }
+  footer { color: var(--muted); font-size: .8rem; margin-top: 32px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>畫圖找股</h1>
+  <p class="sub">在畫布上一筆畫出你想要的走勢，找出最近一段期間走勢最像的台股（上市、上櫃）。</p>
+
+  <div class="panel">
+    <canvas id="pad"></canvas>
+    <div class="controls">
+      <label>比對期間
+        <select id="period">
+          <option value="20">近 20 日（約 1 個月）</option>
+          <option value="60" selected>近 60 日（約 3 個月）</option>
+          <option value="120">近 120 日（約半年）</option>
+          <option value="240">近 240 日（約 1 年）</option>
+        </select>
+      </label>
+      <label>相似度門檻
+        <input id="threshold" type="range" min="0.5" max="0.99" step="0.01" value="0.80">
+        <span id="thresholdVal" class="num">0.80</span>
+      </label>
+      <label>最多顯示
+        <select id="limit">
+          <option>20</option><option selected>50</option><option>100</option>
+        </select>
+      </label>
+      <button id="clear">清除</button>
+    </div>
+  </div>
+
+  <div id="status">載入股價資料中…</div>
+  <div class="legend" id="legend" hidden>
+    <span><i style="background:var(--accent)"></i>股價（調整後收盤）</span>
+    <span><i style="background:var(--stroke)"></i>你的圖形</span>
+  </div>
+  <div id="results"></div>
+
+  <footer>資料來源：FinLab（調整後收盤價），每個交易日自動更新。相似度為 Pearson 相關係數，僅比較形狀、不比較漲跌幅大小。本工具僅供參考，不構成投資建議。</footer>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const pad = $("pad");
+const ctx = pad.getContext("2d");
+let stroke = [];      // [{x, y}] in CSS pixels
+let drawing = false;
+let DATA = null;
+
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+function fitCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const r = canvas.getBoundingClientRect();
+  canvas.width = Math.round(r.width * dpr);
+  canvas.height = Math.round(r.height * dpr);
+  const c = canvas.getContext("2d");
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { c, w: r.width, h: r.height };
+}
+
+function redrawPad() {
+  const { c, w, h } = fitCanvas(pad);
+  c.strokeStyle = css("--grid");
+  c.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    c.beginPath(); c.moveTo(0, h * i / 4); c.lineTo(w, h * i / 4); c.stroke();
+  }
+  if (!stroke.length) {
+    c.fillStyle = css("--muted");
+    c.font = "15px system-ui, sans-serif";
+    c.textAlign = "center";
+    c.fillText("由左至右畫一條走勢線（只能畫一筆）", w / 2, h / 2);
+    return;
+  }
+  c.strokeStyle = css("--stroke");
+  c.lineWidth = 3; c.lineJoin = "round"; c.lineCap = "round";
+  c.beginPath();
+  stroke.forEach((p, i) => i ? c.lineTo(p.x, p.y) : c.moveTo(p.x, p.y));
+  c.stroke();
+}
+
+function pos(e) {
+  const r = pad.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+pad.addEventListener("pointerdown", (e) => {
+  pad.setPointerCapture(e.pointerId);
+  drawing = true;
+  stroke = [pos(e)];   // a new stroke always replaces the previous one
+  redrawPad();
+});
+pad.addEventListener("pointermove", (e) => {
+  if (!drawing) return;
+  stroke.push(pos(e));
+  redrawPad();
+});
+const endStroke = () => {
+  if (!drawing) return;
+  drawing = false;
+  search();
+};
+pad.addEventListener("pointerup", endStroke);
+pad.addEventListener("pointercancel", endStroke);
+
+// Turn the free-form stroke into n evenly spaced y values (higher = larger value).
+// Each x column takes the mean y of the stroke there; empty columns are interpolated.
+function strokeToSeries(n) {
+  if (stroke.length < 2) return null;
+  const xs = stroke.map(p => p.x);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  if (x1 - x0 < 20) return null;
+
+  // Densify segments so fast strokes still fill every column.
+  const pts = [];
+  for (let i = 1; i < stroke.length; i++) {
+    const a = stroke[i - 1], b = stroke[i];
+    const steps = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y)));
+    for (let s = 0; s < steps; s++) {
+      const t = s / steps;
+      pts.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+    }
+  }
+  pts.push(stroke[stroke.length - 1]);
+
+  const sum = new Array(n).fill(0), cnt = new Array(n).fill(0);
+  for (const p of pts) {
+    const k = Math.min(n - 1, Math.floor((p.x - x0) / (x1 - x0) * n));
+    sum[k] += -p.y; cnt[k]++;
+  }
+  const out = sum.map((s, i) => cnt[i] ? s / cnt[i] : null);
+  const known = out.map((v, i) => v === null ? -1 : i).filter(i => i >= 0);
+  for (let i = 0; i < n; i++) {
+    if (out[i] !== null) continue;
+    const prev = known.filter(k => k < i).pop();
+    const next = known.find(k => k > i);
+    if (prev === undefined) out[i] = out[next];
+    else if (next === undefined) out[i] = out[prev];
+    else out[i] = out[prev] + (out[next] - out[prev]) * (i - prev) / (next - prev);
+  }
+  return out;
+}
+
+function zscore(a) {
+  const n = a.length;
+  let m = 0; for (const v of a) m += v; m /= n;
+  let s = 0; for (const v of a) s += (v - m) ** 2;
+  s = Math.sqrt(s / n);
+  if (s === 0) return null;
+  return a.map(v => (v - m) / s);
+}
+
+function search() {
+  if (!DATA) return;
+  const n = +$("period").value;
+  const threshold = +$("threshold").value;
+  const limit = +$("limit").value;
+  const target = strokeToSeries(n);
+  const results = $("results");
+  results.innerHTML = "";
+  $("legend").hidden = true;
+  if (!target) { $("status").textContent = "請在畫布上畫一條較長的走勢線。"; return; }
+  const tz = zscore(target);
+  if (!tz) { $("status").textContent = "畫的是一條水平線，請畫出有起伏的走勢。"; return; }
+
+  const dates = DATA.dates.slice(-n);
+  const hits = [];
+  DATA.close.forEach((series, idx) => {
+    const win = series.slice(-n);
+    if (win.length < n || win.some(v => v === null)) return;
+    const z = zscore(win);
+    if (!z) return;
+    let r = 0; for (let i = 0; i < n; i++) r += z[i] * tz[i];
+    r /= n;
+    if (r >= threshold) hits.push({ idx, r, win });
+  });
+  hits.sort((a, b) => b.r - a.r);
+
+  $("status").textContent = hits.length
+    ? `${dates[0]} ~ ${dates[n - 1]}，共 ${hits.length} 檔相似度 ≥ ${threshold.toFixed(2)}` +
+      (hits.length > limit ? `，顯示前 ${limit} 檔` : "")
+    : `${dates[0]} ~ ${dates[n - 1]}，沒有相似度 ≥ ${threshold.toFixed(2)} 的股票，試著降低門檻。`;
+  if (!hits.length) return;
+  $("legend").hidden = false;
+
+  for (const h of hits.slice(0, limit)) {
+    const s = DATA.stocks[h.idx];
+    const ret = h.win[n - 1] / h.win[0] - 1;
+    const a = document.createElement("a");
+    a.className = "card";
+    a.href = `https://tw.stock.yahoo.com/quote/${s.id}`;
+    a.target = "_blank"; a.rel = "noopener";
+    a.innerHTML = `
+      <div class="head">
+        <div><span class="name"></span><span class="id"></span></div>
+        <span class="score">${(h.r * 100).toFixed(1)}%</span>
+      </div>
+      <canvas></canvas>
+      <div class="meta"><span class="info"></span>
+        <span class="${ret >= 0 ? "up" : "down"}">${ret >= 0 ? "+" : ""}${(ret * 100).toFixed(1)}%</span></div>`;
+    a.querySelector(".name").textContent = s.name;
+    a.querySelector(".id").textContent = s.id;
+    a.querySelector(".info").textContent = `${s.market}・${s.industry}`;
+    results.appendChild(a);
+    drawSpark(a.querySelector("canvas"), zscore(h.win), tz);
+  }
+}
+
+function drawSpark(canvas, price, target) {
+  const { c, w, h } = fitCanvas(canvas);
+  const all = price.concat(target);
+  const lo = Math.min(...all), hi = Math.max(...all);
+  const pad = 4;
+  const line = (a, color, width) => {
+    c.strokeStyle = color; c.lineWidth = width; c.lineJoin = "round";
+    c.beginPath();
+    a.forEach((v, i) => {
+      const x = i / (a.length - 1) * w;
+      const y = pad + (1 - (v - lo) / (hi - lo)) * (h - 2 * pad);
+      i ? c.lineTo(x, y) : c.moveTo(x, y);
+    });
+    c.stroke();
+  };
+  c.globalAlpha = 0.55; line(target, css("--stroke"), 2);
+  c.globalAlpha = 1; line(price, css("--accent"), 1.6);
+}
+
+$("threshold").addEventListener("input", (e) => { $("thresholdVal").textContent = (+e.target.value).toFixed(2); });
+["threshold", "period", "limit"].forEach(id => $(id).addEventListener("change", search));
+$("clear").addEventListener("click", () => {
+  stroke = []; redrawPad();
+  $("results").innerHTML = ""; $("legend").hidden = true;
+  $("status").textContent = DATA ? `資料更新至 ${DATA.dates.at(-1)}，共 ${DATA.stocks.length} 檔。` : "";
+});
+window.addEventListener("resize", redrawPad);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { redrawPad(); search(); });
+
+redrawPad();
+fetch("data/prices.json", { cache: "no-cache" })
+  .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+  .then(d => {
+    DATA = d;
+    $("status").textContent = `資料更新至 ${d.dates.at(-1)}，共 ${d.stocks.length} 檔。在上方畫出走勢開始搜尋。`;
+    if (stroke.length) search();
+  })
+  .catch(err => { $("status").textContent = `股價資料載入失敗（${err.message}）。`; });
+</script>
+</body>
+</html>

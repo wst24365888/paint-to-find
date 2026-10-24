@@ -1,0 +1,9 @@
+[project]
+name = "paint-to-find"
+version = "0.1.0"
+description = "Draw a price shape, find Taiwan stocks that match it."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "finlab>=2.2.16",
+]

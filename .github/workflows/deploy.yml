@@ -1,0 +1,45 @@
+name: Update prices & deploy
+
+on:
+  push:
+    branches: [main, master]
+  schedule:
+    # 台灣時間週一至週五 18:30（UTC 10:30），收盤後 FinLab 資料已更新
+    - cron: "30 10 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Fetch prices from FinLab
+        env:
+          FINLAB_REFRESH_TOKEN: ${{ secrets.FINLAB_REFRESH_TOKEN }}
+          FINLAB_SESSION_ID: ${{ secrets.FINLAB_SESSION_ID }}
+          FINLAB_API_KEY: ${{ secrets.FINLAB_API_KEY }}
+        run: uv run python update_data.py
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
