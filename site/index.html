@@ -74,6 +74,23 @@
         <input id="threshold" type="range" min="0.5" max="0.99" step="0.01" value="0.80">
         <span id="thresholdVal" class="num">0.80</span>
       </label>
+      <label>時間彈性
+        <select id="flex" title="允許圖形在時間軸上局部拉伸或壓縮（DTW），例如鋸齒寬度不同也能對上">
+          <option value="0">關閉（嚴格對齊）</option>
+          <option value="0.1">低（±10%）</option>
+          <option value="0.2" selected>中（±20%）</option>
+          <option value="0.3">高（±30%）</option>
+        </select>
+      </label>
+      <label>尾部加權
+        <select id="tailWeight" title="最後 20% 期間在相似度中的權重倍數">
+          <option value="1">關閉</option><option value="2">2 倍</option>
+          <option value="3" selected>3 倍</option><option value="5">5 倍</option>
+        </select>
+      </label>
+      <label title="最後 20% 期間的走勢與圖形相關係數需 ≥ 0.5">
+        <input id="tailMatch" type="checkbox" checked> 尾段需同向
+      </label>
       <label>價格刻度
         <select id="scale" title="對數刻度以漲跌百分比比較形狀，長期間或大漲大跌時差異較明顯">
           <option value="linear" selected>線性（真實股價）</option>
@@ -103,7 +120,7 @@
   </div>
   <div id="results"></div>
 
-  <footer>資料來源：FinLab（調整後股價），每個交易日自動更新。相似度為收盤價與圖形的 Pearson 相關係數，僅比較形狀、不比較漲跌幅大小。本工具僅供參考，不構成投資建議。圖表使用 <a href="https://www.tradingview.com/lightweight-charts/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a>。</footer>
+  <footer>資料來源：FinLab（調整後股價），每個交易日自動更新。相似度以 DTW（允許時間軸局部伸縮）比較收盤價與圖形的形狀，最後 20% 期間加權；關閉時間彈性即為加權 Pearson 相關係數。僅比較形狀、不比較漲跌幅大小。本工具僅供參考，不構成投資建議。圖表使用 <a href="https://www.tradingview.com/lightweight-charts/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a>。</footer>
 </main>
 
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
@@ -210,13 +227,84 @@ function strokeToSeries(n) {
   return out;
 }
 
-function zscore(a) {
+const TAIL_FRAC = 0.2;     // the "recent trend" part of the window
+const TAIL_MIN_R = 0.5;    // tail correlation required when 尾段需同向 is on
+const DTW_PENALTY = 0.5;    // extra cost per stretch/squeeze step, keeps warping from over-fitting
+
+const tailLength = (n) => Math.min(n, Math.max(3, Math.round(n * TAIL_FRAC)));
+
+function timeWeights(n, tailMult) {
+  const t = tailLength(n);
+  return Float64Array.from({ length: n }, (_, i) => i >= n - t ? tailMult : 1);
+}
+
+// Weighted z-score; mean and spread use the same time weights as the match.
+function zscore(a, w) {
   const n = a.length;
-  let m = 0; for (const v of a) m += v; m /= n;
-  let s = 0; for (const v of a) s += (v - m) ** 2;
-  s = Math.sqrt(s / n);
-  if (s === 0) return null;
-  return a.map(v => (v - m) / s);
+  let sw = 0, m = 0;
+  for (let i = 0; i < n; i++) { sw += w[i]; m += w[i] * a[i]; }
+  m /= sw;
+  let v = 0;
+  for (let i = 0; i < n; i++) v += w[i] * (a[i] - m) ** 2;
+  v = Math.sqrt(v / sw);
+  if (v < 1e-12) return null;
+  return Float64Array.from(a, x => (x - m) / v);
+}
+
+function pearson(a, b) {
+  const n = a.length;
+  let ma = 0, mb = 0;
+  for (let i = 0; i < n; i++) { ma += a[i]; mb += b[i]; }
+  ma /= n; mb /= n;
+  let sab = 0, saa = 0, sbb = 0;
+  for (let i = 0; i < n; i++) {
+    const da = a[i] - ma, db = b[i] - mb;
+    sab += da * db; saa += da * da; sbb += db * db;
+  }
+  return saa && sbb ? sab / Math.sqrt(saa * sbb) : 0;
+}
+
+// Banded DTW between stock x and drawing y (weighted z-scores, same length).
+// Lets the drawing stretch or squeeze locally by up to `band` days. Similarity
+// is 1 - (weighted mean squared distance) / 2, which for band 0 is exactly the
+// weighted Pearson correlation, so the threshold keeps its meaning.
+let dtwCost, dtwW, dtwStep;
+function dtw(x, y, w, band) {
+  const n = x.length;
+  if (!dtwCost || dtwCost.length !== n * n) {
+    dtwCost = new Float64Array(n * n); dtwW = new Float64Array(n * n); dtwStep = new Uint8Array(n * n);
+  }
+  for (let i = 0; i < n; i++) {
+    const j0 = Math.max(0, i - band), j1 = Math.min(n - 1, i + band);
+    for (let j = j0; j <= j1; j++) {
+      const k = i * n + j;
+      const wij = (w[i] + w[j]) / 2;
+      const c = wij * (x[i] - y[j]) ** 2;
+      if (i === 0 && j === 0) { dtwCost[k] = c; dtwW[k] = wij; dtwStep[k] = 0; continue; }
+      let best = Infinity, from = -1, step = 0;
+      if (i > 0 && j > 0) { best = dtwCost[k - n - 1]; from = k - n - 1; step = 0; }
+      const pen = DTW_PENALTY * wij;
+      if (i > 0 && j <= i - 1 + band && dtwCost[k - n] + pen < best) { best = dtwCost[k - n] + pen; from = k - n; step = 1; }
+      if (j > 0 && j - 1 >= i - band && dtwCost[k - 1] + pen < best) { best = dtwCost[k - 1] + pen; from = k - 1; step = 2; }
+      dtwCost[k] = best + c; dtwW[k] = dtwW[from] + wij; dtwStep[k] = step;
+    }
+  }
+  const end = n * n - 1;
+  return 1 - dtwCost[end] / (2 * dtwW[end]);
+}
+
+// The drawing as the last dtw() call aligned it to the stock: one value per stock day.
+function warpedTarget(y) {
+  const n = y.length;
+  const sum = new Float64Array(n), cnt = new Uint16Array(n);
+  let i = n - 1, j = n - 1;
+  for (;;) {
+    sum[i] += y[j]; cnt[i]++;
+    if (i === 0 && j === 0) break;
+    const step = dtwStep[i * n + j];
+    if (step === 0) { i--; j--; } else if (step === 1) i--; else j--;
+  }
+  return Float64Array.from(sum, (v, k) => v / cnt[k]);
 }
 
 const CONTEXT_BARS = 20;  // short windows still show at least this many bars for context
@@ -244,10 +332,14 @@ function search() {
   const limit = +$("limit").value;
   const minAmp = +$("minAmp").value;
   const logScale = $("scale").value === "log";
+  const band = Math.round(+$("flex").value * n);
+  const w = timeWeights(n, +$("tailWeight").value);
+  const tailMatch = $("tailMatch").checked;
+  const tail = tailLength(n);
   const target = strokeToSeries(n);
   clearResults();
   if (!target) { $("status").textContent = "請在畫布上畫一條較長的走勢線。"; return; }
-  const tz = zscore(target);
+  const tz = zscore(target, w);
   if (!tz) { $("status").textContent = "畫的是一條水平線，請畫出有起伏的走勢。"; return; }
 
   const dates = DATA.dates.slice(-n);
@@ -255,13 +347,15 @@ function search() {
   DATA.close.forEach((series, idx) => {
     const win = series.slice(-n);
     if (win.length < n || win.some(v => v === null || v <= 0)) return;
-    const z = zscore(logScale ? win.map(Math.log) : win);
-    if (!z) return;
-    let r = 0; for (let i = 0; i < n; i++) r += z[i] * tz[i];
-    r /= n;
-    if (r < threshold) return;
     const amp = Math.max(...win) / Math.min(...win) - 1;
-    if (amp >= minAmp) hits.push({ idx, r, win, amp });
+    if (amp < minAmp) return;
+    const z = zscore(logScale ? win.map(Math.log) : win, w);
+    if (!z) return;
+    const r = dtw(z, tz, w, band);
+    if (r < threshold) return;
+    const warped = warpedTarget(tz);
+    if (tailMatch && pearson(z.subarray(n - tail), warped.subarray(n - tail)) < TAIL_MIN_R) return;
+    hits.push({ idx, r, win, amp, warped });
   });
   hits.sort((a, b) => b.r - a.r);
 
@@ -291,12 +385,12 @@ function search() {
     card.querySelector(".info").textContent = `${s.market}・${s.industry}`;
     $("results").appendChild(card);
     const el = card.querySelector(".chart");
-    el._render = () => renderCandles(el, s.id, h.win, tz, logScale);
+    el._render = () => renderCandles(el, s.id, h.win, h.warped, w, logScale);
     chartObserver.observe(el);
   }
 }
 
-async function renderCandles(el, id, win, tz, logScale) {
+async function renderCandles(el, id, win, warped, w, logScale) {
   let ohlc;
   try {
     const r = await fetch(`data/ohlc/${id}.json?v=${encodeURIComponent(DATA.updated)}`);
@@ -323,12 +417,16 @@ async function renderCandles(el, id, win, tz, logScale) {
     bars.push(bar);
   }
 
-  // Map the drawn shape onto the matched window's price level and spread.
-  // In log mode the fit happens on log prices, so map back with exp.
+  // Map the (time-warped) drawing onto the window's price level and spread,
+  // using the same weighted stats as the match. Log mode maps back with exp.
   const base = logScale ? win.map(Math.log) : win;
-  const mean = base.reduce((a, b) => a + b, 0) / n;
-  const sd = Math.sqrt(base.reduce((a, b) => a + (b - mean) ** 2, 0) / n);
-  const shape = tz.map((z, i) => {
+  let sw = 0, mean = 0;
+  for (let i = 0; i < n; i++) { sw += w[i]; mean += w[i] * base[i]; }
+  mean /= sw;
+  let sd = 0;
+  for (let i = 0; i < n; i++) sd += w[i] * (base[i] - mean) ** 2;
+  sd = Math.sqrt(sd / sw);
+  const shape = Array.from(warped, (z, i) => {
     const v = mean + z * sd;
     return { time: DATA.dates[total - n + i], value: logScale ? Math.exp(v) : v };
   });
@@ -363,7 +461,7 @@ async function renderCandles(el, id, win, tz, logScale) {
 }
 
 $("threshold").addEventListener("input", (e) => { $("thresholdVal").textContent = (+e.target.value).toFixed(2); });
-["threshold", "period", "scale", "minAmp", "limit"].forEach(id => $(id).addEventListener("change", search));
+["threshold", "period", "flex", "tailWeight", "tailMatch", "scale", "minAmp", "limit"].forEach(id => $(id).addEventListener("change", search));
 $("clear").addEventListener("click", () => {
   stroke = []; redrawPad();
   clearResults();
